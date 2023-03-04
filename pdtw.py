@@ -1,4 +1,5 @@
-from utils import combined_shape, pdist_cos, pdist_euc, get_chunksize
+from utils import (combined_shape, pdist_cos, pdist_euc,
+                   get_chunksize, index_to_coords)
 
 import math
 import pathlib
@@ -65,6 +66,18 @@ class PDTWConfig:
 
 
 def pdtw(features: List[npt.NDArray], config: PDTWConfig):
+    '''
+    Runs the whole probabilistic distance timewarping algorithm
+    (low and high resolution search) for the given data-set
+
+    Parameters
+    ----------
+    features: List[npt.NDArray]
+        The list of features from the raw audio clips. Should have shape
+        (n_features, frame-lenght)
+    config: PDTWConfig
+        The configuration for the run.
+    '''
     ds_feats = _preprocess(
             features, config.seq_shift, config.seq_len, config.n_segments
     )
@@ -111,8 +124,11 @@ def low_res_search(features: List[npt.NDArray], config: PDTWConfig):
             features, config.seq_shift, config.seq_len, config.n_frames
     )
 
+    # NOTE: Check that this is not set multiple times during the run
     nb.set_num_threads(config.n_workers)
-    return _low_res_candidate_search_impl(ds_feats, features[0].shape[0])
+    return _low_res_candidate_search_impl(
+            ds_feats, features[0].shape[0], config
+            )
 
 
 # ---> Implementations
@@ -195,7 +211,7 @@ def _preprocess(
 
 
 def _low_res_candidate_search_impl(
-        ds_feats: npt.NDArray, original_shape: int
+        ds_feats: npt.NDArray, original_shape: int, config: PDTWConfig
         ) -> Tuple[npt.NDArray, npt.NDArray]:
     '''
     Run the low-resolution candidate search for the dataset
@@ -206,6 +222,8 @@ def _low_res_candidate_search_impl(
         The downsampled feature vectors
     original_shape: int
         The size of the original dataset.
+    config: PDTWConfig
+        The configuration for the run
 
     Returns
     -------
@@ -213,13 +231,19 @@ def _low_res_candidate_search_impl(
         The distance probabilities and the candidate segment indexes
     '''
     silent_idx = _voice_activity_detection(ds_feats, original_shape)
-    print(silent_idx)
-    distance_distr = _random_distances(ds_feats)
+    print(f"Running for array of shape {ds_feats.shape}")
+    distance_distr = _random_distances(
+            ds_feats, config.n_nearest, config.max_ram, config.n_workers
+    )
 
     # Fit the GMM model to the distance distribution
     idx = np.isnan(distance_distr)
     # Remove any nan values
     distance_distr = distance_distr[~idx]
+    # make array 2D for the fitting (1 feature, multple samples)
+    distance_distr = distance_distr.reshape(-1, 1)
+
+    # Create and fit the model to the distance distribution
     model = GaussianMixture(
             n_components=1, covariance_type="diag",
             init_params="random_from_data", warm_start=True
@@ -231,10 +255,13 @@ def _low_res_candidate_search_impl(
     sort_idx = np.argsort(means)
     means = means[sort_idx]
     vars = model.covariances_.copy()[sort_idx]
-    weights = model.weights_.copy()[sort_idx]
+    # weights = model.weights_.copy()[sort_idx]
 
     # Match the lower candidates
-    dist_probs, candidates = _find_n_nearest_segments(ds_feats)
+    dist_probs, candidates = _find_n_nearest_segments(
+            ds_feats, config.n_nearest, config.n_expansion, means, vars,
+            config.alpha, config.max_ram, config.n_workers
+    )
     return dist_probs, candidates
 
 
@@ -299,8 +326,9 @@ def _voice_activity_detection(
 
 @nb.njit(
         cache=True, parallel=True, locals={
-            'loc': nb.uint64, 'i': nb.uint64, 'dist_distr': nb.float64[:, :],
-            'chunk_size': nb.uint64, 'n_chunks': nb.uint64
+            'loc': nb.uint64, 'dist_distr': nb.float64[:, :],
+            'chunk_size': nb.uint64, 'n_chunks': nb.uint64,
+            "n_cols": nb.uint64, "dist_mtx": nb.float64[:, :]
         }
 )
 def _random_distances(
@@ -333,9 +361,11 @@ def _random_distances(
     # Assuming here that the split went evenly
     dist_distr = np.zeros((n_chunks, ds_feats.shape[0]*n_nearest))
 
-    loc = 0
-    i = 0
+    # Iterate over each "chunk" of the data.
+    # Writing to dist_distr is safe, as we are never assigning to same index
+    # from same coordinates
     for chunk in nb.prange(n_chunks):
+        loc = chunk*chunk_size
         endpoint = min(loc + chunk_size, ds_feats.shape[0])
         dist_mtx = pdist_cos(ds_feats[loc:endpoint, :], ds_feats)
 
@@ -343,12 +373,20 @@ def _random_distances(
         # style random number generation. It should suffice for now.
 
         # Select the samples to check at random
+        # TODO: Ensure that these are actually generated randomly for each
+        # iteration
         idx = np.random.randint(
                 0, high=ds_feats.size, size=ds_feats.shape[0]*n_nearest
         )
-        xi, yi = np.unravel_index(idx, dist_mtx.shape)
-        dist_distr[i, :] = dist_mtx[xi, yi]
-        i += 1
+
+        # NOTE: Numba doesn't currently support np.unravel_index nor indexing
+        # by multiple numpy arrays at the sametime, and thus the copying must
+        # be done manually.
+        n_cols = dist_mtx.shape[1]
+        for ii in nb.prange(idx.shape[0]):
+            lin_index = idx[ii]
+            xi, yi = lin_index // n_cols, lin_index % n_cols
+            dist_distr[chunk, ii] = dist_mtx[xi, yi]
     return dist_distr
 
 
@@ -406,10 +444,8 @@ def _find_n_nearest_segments(
                 if 0 <= idx <= dist_near.shape[0]:
                     dist_near[ii, loc+i+ii] = np.nan
 
-        # Sort only the first n_nearest elements that we are looking for.
-        # This is only O(n) operation compared to O(n*log(n)) for full sort
-
-        # TODO: !!! argpartition is not supported with parallel true!!!
+        # TODO: Change the argsort for argpartition when it becomes supported
+        # in parallel computation! (O(n*log(n)) vs O(n))
         ind_near = np.argsort(dist_near, axis=-1)[:n_nearest]
         dist_near = dist_near[ind_near]
         dist_near = dist_near[:n_nearest, :]

@@ -77,6 +77,34 @@ def load_features(dir_path: Path) -> List[npt.NDArray]:
     return [np.load(fp) for fp in dir_path.glob("*.npy")]
 
 
+@nb.njit
+def index_to_coords(
+        index: npt.NDArray, shape: Tuple[int, int]
+        ) -> Tuple[npt.NDArray, npt.NDArray]:
+    '''
+    Convert the linear indexes to 2D coordinates
+    (Similarly to what np.unravel_index does).
+
+    Parameters
+    ----------
+    indexes: npt.NDArray
+        List of linear indexes to a 2d numpy array
+    shape: Tuple[int, int]
+        The shape of the target array
+
+    Returns
+    -------
+    Tuple[npt.NDArray, npt.NDArray]
+        The corresponding 2D indexes (x first, y second)
+    '''
+    xs = np.empty(index.size)
+    ys = np.empty(index.size)
+    for ii, idx in enumerate(index):
+        xs[ii] = idx // shape[1]
+        ys[ii] = idx % shape[1]
+    return xs, ys
+
+
 @nb.njit(
         nb.float64[:, :](nb.float64[:, :], nb.float64[:, :]),
         locals={'tmp1': nb.float64, 'tmp2': nb.float64}
