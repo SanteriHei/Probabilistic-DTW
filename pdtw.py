@@ -20,6 +20,11 @@ import numpy.typing as npt
 # Format for the timestamps
 _TS_FORMAT: str = "%H-%M-%ST%d-%m-%Y"
 
+# Mark indexes of neighbouring frames with max value of 64 bit unsigned
+# integers  (which is in index that should not appear)
+# (so that the dtype can be int)
+_IS_NEIGHBOUR: int = np.iinfo(np.uint64).max
+
 
 @dataclass
 class PDTWConfig:
@@ -212,7 +217,7 @@ def _preprocess(
 
 def _low_res_candidate_search_impl(
         ds_feats: npt.NDArray, original_shape: int, config: PDTWConfig
-        ) -> Tuple[npt.NDArray, npt.NDArray]:
+        ) -> Tuple[npt.NDArray, npt.NDArray, npt.NDArray]:
     '''
     Run the low-resolution candidate search for the dataset
 
@@ -227,8 +232,9 @@ def _low_res_candidate_search_impl(
 
     Returns
     -------
-    Tuple[npt.NDArray, npt.NDArray]
-        The distance probabilities and the candidate segment indexes
+    Tuple[npt.NDArray, npt.NDArray, npt.NDArray]
+        Returns the distance probabilities, candidates the indices and the
+        segments where the clips are silent.
     '''
     silent_idx = _voice_activity_detection(ds_feats, original_shape)
     print(f"Running for array of shape {ds_feats.shape}")
@@ -262,7 +268,10 @@ def _low_res_candidate_search_impl(
             ds_feats, config.n_nearest, config.n_expansion, means, vars,
             config.alpha, config.max_ram, config.n_workers
     )
-    return dist_probs, candidates
+
+    # Remove possible duplicates (i.e. pairs that are in same order)
+    candidates = _prune_candidates(candidates)
+    return dist_probs, candidates, silent_idx
 
 
 def _high_res_alignment_search_impl(x: npt.NDArray):
@@ -353,8 +362,9 @@ def _random_distances(
     # NOTE: The chunking is done approximately to respect user boundaries, but
     # in such way that the output can be shaped similarly
 
-    # float64 -> 8 bytes per element
-    n_samples = math.floor(max_ram/8/n_workers)
+    # The amount of samples the array is going to have, given the RAM
+    # constraints placed by the user
+    n_samples = math.floor(max_ram/ds_feats.itemsize/n_workers)
     chunk_size = math.floor(n_samples/ds_feats.shape[0])
     n_chunks = math.floor(ds_feats.shape[0]/chunk_size)
 
@@ -409,7 +419,7 @@ def _find_n_nearest_segments(
     n_lap_frames: int
         How many neighbouring segments are discarded from the matching.
     mu: npt.NDArray
-        The mean values from the
+        The mean values extracted from the fitted GMM.
     var: npt.NDArray
         The covariance values extracted from the fitted GMM.
     alpha: float
@@ -428,7 +438,9 @@ def _find_n_nearest_segments(
     candidate_indices = np.empty((x.shape[0], n_nearest))
 
     # using 64 bit floats -> 8 bytes per element.
-    chunksize = math.floor(max_ram/8/n_workers/x.shape[0])
+    # Calculate the amount of samples per worker, and then divide that by
+    # the amount of samples to get the chunk-size for the data
+    chunksize = math.floor(max_ram/x.itemsize/n_workers/x.shape[0])
     n_chunks = math.ceil(x.shape[0]/chunksize)
     loc = 1
     for chunk in nb.prange(n_chunks):
@@ -448,10 +460,12 @@ def _find_n_nearest_segments(
         # in parallel computation! (O(n*log(n)) vs O(n))
         ind_near = np.argsort(dist_near, axis=-1)[:n_nearest]
         dist_near = dist_near[ind_near]
+
+        # TODO: Does this work with numba parallel?
         dist_near = dist_near[:n_nearest, :]
         ind_near = ind_near[:n_nearest, :]
 
-        ind_near[np.isnan(dist_near)] = np.nan
+        ind_near[np.isnan(dist_near)] = _IS_NEIGHBOUR
 
         # Convert the distances to probabilities, that measure how likely it is
         # that such small distances are encoutered in the corpus
@@ -469,3 +483,31 @@ def _find_n_nearest_segments(
         loc += chunksize
 
     return dist_probs, candidate_indices
+
+
+@nb.njit
+def _prune_candidates(indexes: npt.NDArray) -> npt.NDArray:
+    '''
+    Removes possible duplicates (i.e. pairs that appear multiple times in
+    in different order from the dataset)
+
+    Parameters
+    ----------
+    indexes: npt.NDArray
+        The indexes of the candidates
+    '''
+    amount_of_neighbours = 0
+    for i in range(indexes.shape[0]):
+        for j in range(indexes.shape[1]):
+            val = indexes[i, j]
+            if val != _IS_NEIGHBOUR:
+                # Find if the array has same values, but without the other-way
+                # around
+                for k in range(indexes.shape[1]):
+                    val2 = indexes[val, k]
+                    if val2 == i:
+                        indexes[val, k] = _IS_NEIGHBOUR
+                        amount_of_neighbours += 1
+            else:
+                amount_of_neighbours += 1
+    return indexes

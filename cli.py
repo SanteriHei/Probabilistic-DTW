@@ -48,7 +48,7 @@ def _low_res_search(args: argparse.Namespace):
     )
 
     features = utils.load_features(args.feature_path)
-    dist_probs, candidates = low_res_search(features, config)
+    dist_probs, candidates, silent_idx = low_res_search(features, config)
 
     if config.verbose:
         print(f"Found {candidates.shape[0]} candidates")
@@ -63,7 +63,10 @@ def _low_res_search(args: argparse.Namespace):
 
     ts = datetime.datetime.now().strftime(_TS_FORMAT)
     fp = dir_path / f"candidates_{ts}.npz"
-    np.savez(fp, dist_probs=dist_probs, candidates=candidates)
+    np.savez(
+            fp, dist_probs=dist_probs, candidates=candidates,
+            silent_idx=silent_idx
+    )
     print(f"Saved candidate to {str(fp)!r}")
 
 

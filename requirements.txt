@@ -1,0 +1,8 @@
+librosa
+scipy
+resampy
+scikit-learn
+numba
+numba_stats
+matplotlib
+tdqm
