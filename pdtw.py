@@ -1,5 +1,4 @@
-from utils import (combined_shape, pdist_cos, pdist_euc,
-                   get_chunksize, index_to_coords)
+from utils import (combined_shape, pdist_cos, pdist_euc, mode, norm_cdf)
 
 import math
 import pathlib
@@ -11,7 +10,7 @@ import scipy.stats as stats
 from sklearn.mixture import GaussianMixture
 from sklearn.metrics import pairwise_distances_argmin
 import numba as nb
-from numba_stats import norm
+# from numba_stats import norm
 
 from typing import List, Tuple
 import numpy.typing as npt
@@ -109,7 +108,9 @@ def pdtw(features: List[npt.NDArray], config: PDTWConfig):
     _high_res_alignment_search_impl()
 
 
-def low_res_search(features: List[npt.NDArray], config: PDTWConfig):
+def low_res_search(
+        features: List[npt.NDArray], config: PDTWConfig
+        ) -> Tuple[npt.NDArray, npt.NDArray, npt.NDArray, npt.NDArray, npt.NDArray]:
     '''
     Runs the low resolution candidate search for the given feature vectors.
 
@@ -122,22 +123,24 @@ def low_res_search(features: List[npt.NDArray], config: PDTWConfig):
 
     Returns
     -------
-    Tuple[npt.NDArray, npt.NDArray]
-        Returns the distance probabilities and the candidates from the search
+    Tuple[npt.NDArray, npt.NDArray, npt.NDArray, npt.NDArray, npt.NDArray]
+        Returns the downsampled features, the corresponding indices, distance
+        probabilities, possible candidates and the indices to silent segments.
     '''
-    ds_feats = _preprocess(
+    ds_feats, ds_indices = _preprocess(
             features, config.seq_shift, config.seq_len, config.n_frames
     )
 
     # NOTE: Check that this is not set multiple times during the run
     nb.set_num_threads(config.n_workers)
-    return _low_res_candidate_search_impl(
+    dist_probs, candidates, silent_indices = _low_res_candidate_search_impl(
             ds_feats, features[0].shape[0], config
-            )
+    )
+
+    return ds_feats, ds_indices, dist_probs, candidates, silent_indices
 
 
 # ---> Implementations
-
 def _preprocess(
         data: List[npt.NDArray], seq_shift: int, seq_len: int, n_segments: int
         ) -> npt.NDArray:
@@ -212,7 +215,7 @@ def _preprocess(
         tmp = np.mean(x[:, bounds[i]:bounds[i+1], :], axis=1)
         x_downsampled[:, (i*dim):((i+1)*dim)] = tmp
 
-    return x_downsampled
+    return x_downsampled, x_indices
 
 
 def _low_res_candidate_search_impl(
@@ -242,40 +245,41 @@ def _low_res_candidate_search_impl(
             ds_feats, config.n_nearest, config.max_ram, config.n_workers
     )
 
+    print(f"Shape of distance-distribution: {distance_distr.shape}")
     # Fit the GMM model to the distance distribution
     idx = np.isnan(distance_distr)
     # Remove any nan values
     distance_distr = distance_distr[~idx]
-    # make array 2D for the fitting (1 feature, multple samples)
+    # make array 2D for the fitting (1 feature, multiple samples)
     distance_distr = distance_distr.reshape(-1, 1)
 
-    # Create and fit the model to the distance distribution
-    model = GaussianMixture(
-            n_components=1, covariance_type="diag",
-            init_params="random_from_data", warm_start=True
-    )
-    model.fit(distance_distr)
+    # Calculate the mean and variance of the distance distribution
+    # -> These will be considered as parameters for the normal distribution
+    mu = distance_distr.mean()
+    var = distance_distr.var()
 
-    # sort the model properties
-    means = model.means_.copy()
-    sort_idx = np.argsort(means)
-    means = means[sort_idx]
-    vars = model.covariances_.copy()[sort_idx]
-    # weights = model.weights_.copy()[sort_idx]
-
+    print("Starting to match low resolution candidates")
     # Match the lower candidates
     dist_probs, candidates = _find_n_nearest_segments(
-            ds_feats, config.n_nearest, config.n_expansion, means, vars,
+            ds_feats, config.n_nearest, config.n_expansion, mu, var,
             config.alpha, config.max_ram, config.n_workers
     )
 
+    print("Starting to remove dublicate pairs")
     # Remove possible duplicates (i.e. pairs that are in same order)
     candidates = _prune_candidates(candidates)
     return dist_probs, candidates, silent_idx
 
 
-def _high_res_alignment_search_impl(x: npt.NDArray):
-    pass
+def _high_res_alignment_search_impl(x: npt.NDArray, indices: npt.NDArray):
+    '''
+    Perform the high-resolution candidate alignment algorithm
+    '''
+    # Take around 2 million samples from the distances
+    all_dists = np.empty(2000000, dtype=np.float64)
+    loc = 0
+    while loc < all_dists.shape[0]:
+        pass
 
 
 def _voice_activity_detection(
@@ -353,7 +357,12 @@ def _random_distances(
     n_nearest: int
         The amount of samples to select from the distance matrix during each
         iteration
-
+    max_ram: int
+        The maximum amount of RAM to use to store the values at a single time
+        (in bytes).
+    n_workers: int
+        The amount of workers used to run the parallized code TODO: remove this
+        and use numbas api to get the amount of workers.
     Returns
     -------
     npt.NDArray
@@ -378,7 +387,6 @@ def _random_distances(
         loc = chunk*chunk_size
         endpoint = min(loc + chunk_size, ds_feats.shape[0])
         dist_mtx = pdist_cos(ds_feats[loc:endpoint, :], ds_feats)
-
         # NOTE: np.random.Generator is not thread safe with numba -> use old
         # style random number generation. It should suffice for now.
 
@@ -400,10 +408,10 @@ def _random_distances(
     return dist_distr
 
 
-@nb.njit(cache=True, parallel=True)
+@nb.njit(parallel=True)
 def _find_n_nearest_segments(
         x: npt.NDArray, n_nearest: int, n_lap_frames: int,
-        mu: npt.NDArray, var: npt.NDArray, alpha: float, max_ram: int,
+        mu: float, var: float, alpha: float, max_ram: int,
         n_workers: int
         ) -> Tuple[npt.NDArray, npt.NDArray]:
     '''
@@ -418,10 +426,12 @@ def _find_n_nearest_segments(
         The amount of nearest neighbours to consider for each segment.
     n_lap_frames: int
         How many neighbouring segments are discarded from the matching.
-    mu: npt.NDArray
-        The mean values extracted from the fitted GMM.
-    var: npt.NDArray
-        The covariance values extracted from the fitted GMM.
+    mu: float
+        The mean value extracted from the fitted GMM (There should be exactly
+        one as there is single observation)
+    var: float
+        The covariance value extracted from the fitted GMM. (There should be
+        exactky one as there is single observation)
     alpha: float
         The required probability for each match to be considered.
     max_ram: int
@@ -435,18 +445,18 @@ def _find_n_nearest_segments(
         The distance probabilities of the candidates, and the candidate indices
     '''
     dist_probs = np.empty((x.shape[0], n_nearest))
-    candidate_indices = np.empty((x.shape[0], n_nearest))
+    candidate_indices = np.zeros((x.shape[0], n_nearest), dtype=np.uint64)
 
-    # using 64 bit floats -> 8 bytes per element.
     # Calculate the amount of samples per worker, and then divide that by
     # the amount of samples to get the chunk-size for the data
     chunksize = math.floor(max_ram/x.itemsize/n_workers/x.shape[0])
     n_chunks = math.ceil(x.shape[0]/chunksize)
+
     loc = 1
     for chunk in nb.prange(n_chunks):
         endpoint = min(loc + chunksize, x.shape[0])
 
-        # Calculate the pairwise distances in chunks?
+        # Calculate the pairwise distances in chunks
         dist_near = pdist_cos(x[loc:endpoint, :], x)
 
         # Ensure that neighbouring segments are not matched!
@@ -456,36 +466,84 @@ def _find_n_nearest_segments(
                 if 0 <= idx <= dist_near.shape[0]:
                     dist_near[ii, loc+i+ii] = np.nan
 
-        # TODO: Change the argsort for argpartition when it becomes supported
-        # in parallel computation! (O(n*log(n)) vs O(n))
-        ind_near = np.argsort(dist_near, axis=-1)[:n_nearest]
-        dist_near = dist_near[ind_near]
+        # NOTE: Numba doesn't support axis keyword for the argsort, so we must
+        # manually run the sort along the last-axis.
+        # Also, argpartition would be enough here, but it is also un-supported
+        # currently
+        ind_near = np.empty(dist_near.shape, dtype=np.uint64)
+        for i in range(ind_near.shape[0]):
+            ind_near[i, :] = np.argsort(dist_near[i, :])
 
-        # TODO: Does this work with numba parallel?
-        dist_near = dist_near[:n_nearest, :]
-        ind_near = ind_near[:n_nearest, :]
+        # Again, 2D indexing is not allowed, so the sorting of the rows must
+        # be done manually.
+        tmp = np.empty_like(dist_near)
+        for i in range(ind_near.shape[0]):
+            for ii in range(ind_near.shape[1]):
+                tmp[i, ii] = dist_near[i, ind_near[i, ii]]
+        dist_near = tmp
 
-        ind_near[np.isnan(dist_near)] = _IS_NEIGHBOUR
+        dist_near = dist_near[:, :n_nearest]
+        ind_near = ind_near[:, :n_nearest]
+        # Mark the neighbouring frames (i.e. Array values with NaN) to the
+        # indexing table
+        # Again, the fancy indexing is not supported, so do it manually
+        for i in range(ind_near.shape[0]):
+            for ii in range(ind_near.shape[1]):
+                if np.isnan(dist_near[i, ii]):
+                    ind_near[i, ii] = _IS_NEIGHBOUR
 
-        # Convert the distances to probabilities, that measure how likely it is
-        # that such small distances are encoutered in the corpus
-        # NOTE: using numba_stats here, as scipy.stats is not numba aware
+        # Interpret the sampling of the distance distribution as normally
+        # distributed, and calculate the cdf values for it.
+        dist_near = np.ascontiguousarray(dist_near)
+        probs = norm_cdf(dist_near, mu, var)
 
-        probs = norm.cdf(dist_near, mu[0], var[0])
         # Now, select only those canditates that are probable enough
-        dist_near[probs > alpha] = np.nan
-        ind_near[probs > alpha] = np.nan
+        for i in range(dist_near.shape[0]):
+            for ii in range(dist_near.shape[1]):
+                if probs[i, ii] > alpha:
+                    dist_near[i, ii] = np.nan
+                    ind_near[i, ii] = _IS_NEIGHBOUR
 
         # Store the candidates
         dist_probs[loc:endpoint, :] = dist_near
         candidate_indices[loc:endpoint, :] = ind_near
 
         loc += chunksize
-
     return dist_probs, candidate_indices
 
 
 @nb.njit
+def _sample_random_distances(
+        dist_probs: npt.NDArray, candidate_indices: npt.NDArray, n_samples: int
+        ) -> npt.NDArray:
+    '''
+    Sample randomly from the distance distribution to calculate the pair-wise
+    statistics of the frame-level distances.
+
+    Parameters
+    ----------
+    dist_probs: npt.NDArray
+        The distribution of the distances.
+    candidate_indices: npt.NDArray
+        The indexes of the candidate pairs.
+    n_samples: int
+        The amount of samples to pick from the distribution. Should be in range
+        of 10^6
+    '''
+    # out = np.empty(n_samples, dtype=np.float64)
+    # loc = 0
+    # while loc < n_samples:
+    #     k = np.random.randint(0, candidate_indices.shape[0])
+    #     a = candidate_indices[k, :, 1]
+    #     b = candidate_indices[k, :, 2]
+    #     most_common = mode(a)
+    #
+    #     # Create new array, withtout the most-common values
+    #     # Remove most common values from b
+    # pass
+
+
+@nb.njit(nb.uint64[:, :](nb.uint64[:, :]))
 def _prune_candidates(indexes: npt.NDArray) -> npt.NDArray:
     '''
     Removes possible duplicates (i.e. pairs that appear multiple times in
@@ -496,18 +554,14 @@ def _prune_candidates(indexes: npt.NDArray) -> npt.NDArray:
     indexes: npt.NDArray
         The indexes of the candidates
     '''
-    amount_of_neighbours = 0
     for i in range(indexes.shape[0]):
         for j in range(indexes.shape[1]):
             val = indexes[i, j]
-            if val != _IS_NEIGHBOUR:
-                # Find if the array has same values, but without the other-way
-                # around
-                for k in range(indexes.shape[1]):
-                    val2 = indexes[val, k]
-                    if val2 == i:
-                        indexes[val, k] = _IS_NEIGHBOUR
-                        amount_of_neighbours += 1
-            else:
-                amount_of_neighbours += 1
+            if val == _IS_NEIGHBOUR:
+                continue
+            # Find if the array has the same pairs, but the other-way around
+            for k in range(indexes.shape[1]):
+                val2 = indexes[val, k]
+                if val2 == i:
+                    indexes[val, k] = _IS_NEIGHBOUR
     return indexes
